@@ -11,7 +11,7 @@ jobs:
     outputs:
       manifests: ${{ steps.find.outputs.manifests }}
     steps:
-      - uses: actions/checkout@V7
+      - uses: actions/checkout@v7
 
       - name: Find manifest files
         id: find
@@ -30,7 +30,7 @@ jobs:
       matrix:
         manifest: ${{ fromJson(needs.discover.outputs.manifests) }}
     steps:
-      - uses: actions/checkout@V7
+      - uses: actions/checkout@v7
 
       - name: Kiro Validate
         id: kiro-validate
