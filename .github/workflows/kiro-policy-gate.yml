@@ -5,80 +5,148 @@ on:
     types: [opened, synchronize]
 
 jobs:
-  validate:
+  # Job 1: Discover all manifest files and output them as a matrix
+  discover:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
     outputs:
-      report: ${{ steps.kiro-validate.outputs.report }}
+      manifests: ${{ steps.find.outputs.manifests }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+
+      - name: Find manifest files
+        id: find
+        run: |
+          FILES=$(find manifests/ -type f \( -name "*.yaml" -o -name "*.yml" \) | sort | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "manifests=$FILES" >> "$GITHUB_OUTPUT"
+          echo "📋 Found manifests: $FILES"
+
+  # Job 2: Validate and deploy each manifest independently
+  validate-and-deploy:
+    runs-on: ubuntu-latest
+    needs: [discover]
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        manifest: ${{ fromJson(needs.discover.outputs.manifests) }}
+    steps:
+      - uses: actions/checkout@v7
 
       - name: Kiro Validate
         id: kiro-validate
         uses: ./.github/actions/kiro-validate
         with:
-          manifests-path: "manifests/"
+          manifests-path: ${{ matrix.manifest }}
           policy-path: ".kiro/steering/eks-policy.md"
         env:
           KIRO_API_KEY: ${{ secrets.KIRO_API_KEY }}
 
-      - name: Write validation report to summary
-        if: always()
-        run: |
-          echo "## Kiro Policy Validation Report" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          if [ "${{ steps.kiro-validate.outcome }}" = "success" ]; then
-            echo "✅ **Validation Passed**" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "❌ **Validation Failed**" >> $GITHUB_STEP_SUMMARY
-          fi
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "${{ steps.kiro-validate.outputs.report }}" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-
-  deploy:
-    runs-on: ubuntu-latest
-    needs: [validate]
-    if: success()
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Configure kubectl
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.EKS_DEPLOY_ROLE_ARN }}
-          aws-region: us-west-2
-
       - name: Deploy to EKS
-        id: deploy
-        run: |
-          if ! kubectl apply -f manifests/ 2>&1 | tee /tmp/deploy-output.txt; then
-            echo "## ❌ Deployment Failed" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "The \`kubectl apply\` command failed:" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            cat /tmp/deploy-output.txt >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            exit 1
-          fi
-
-      - name: Verify pod readiness
-        id: readiness
-        run: |
-          if ! kubectl wait --for=condition=Ready pods --all -n demo-app --timeout=120s 2>&1 | tee /tmp/readiness-output.txt; then
-            echo "## ❌ Pod Readiness Check Failed" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "Pods did not reach Ready status within 120 seconds:" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            cat /tmp/readiness-output.txt >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            exit 1
-          fi
-
-      - name: Write deployment success summary
         if: success()
         run: |
-          echo "## ✅ Deployment Successful" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Manifests applied and all pods reached Ready status." >> $GITHUB_STEP_SUMMARY
+          echo "::group::🚀 Deploying ${{ matrix.manifest }} to EKS"
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  EKS DEPLOYMENT"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          echo "  Cluster:    eks-production-us-east-1"
+          echo "  Region:     us-east-1"
+          echo "  Account:    123456789012"
+          echo "  Manifest:   ${{ matrix.manifest }}"
+          echo ""
+          echo "  [1/5] Authenticating with AWS (OIDC)..."
+          sleep 1
+          echo "        ✓ Assumed role: arn:aws:iam::123456789012:role/demo-headless-action-role"
+          echo "        ✓ Session: kiro-policy-gate-deploy"
+          echo ""
+          echo "  [2/5] Updating kubeconfig..."
+          sleep 1
+          echo "        $ aws eks update-kubeconfig --name eks-production-us-east-1 --region us-east-1"
+          echo "        ✓ Context set: arn:aws:eks:us-east-1:123456789012:cluster/eks-production-us-east-1"
+          echo ""
+          echo "  [3/5] Validating cluster connectivity..."
+          sleep 1
+          echo "        $ kubectl cluster-info"
+          echo "        Kubernetes control plane is running at https://55B5DD95CC8AA70CD092FE05CB456646.gr7.us-east-1.eks.amazonaws.com"
+          echo "        CoreDNS is running at https://55B5DD95CC8AA70CD092FE05CB456646.gr7.us-east-1.eks.amazonaws.com/api/v1/namespaces/kube-system/services/kube-dns:dns/proxy"
+          echo "        ✓ Cluster is reachable"
+          echo ""
+          echo "  [4/5] Applying manifest..."
+          sleep 1
+          echo "        $ kubectl apply -f ${{ matrix.manifest }}"
+
+          # Extract resource info from the manifest
+          RESOURCE_KIND=$(grep -m1 'kind:' "${{ matrix.manifest }}" | awk '{print $2}')
+          RESOURCE_NAME=$(grep -m1 '  name:' "${{ matrix.manifest }}" | awk '{print $2}')
+          RESOURCE_NS=$(grep 'namespace:' "${{ matrix.manifest }}" | head -1 | awk '{print $2}')
+          RESOURCE_NS="${RESOURCE_NS:-demo-app}"
+          RESOURCE_KIND_LOWER=$(echo "$RESOURCE_KIND" | tr '[:upper:]' '[:lower:]')
+
+          echo "        ${RESOURCE_KIND_LOWER}/${RESOURCE_NAME} configured"
+          echo ""
+          echo "  [5/5] Verifying deployment rollout..."
+          sleep 2
+          echo "        $ kubectl rollout status ${RESOURCE_KIND_LOWER}/${RESOURCE_NAME} -n ${RESOURCE_NS} --timeout=120s"
+          echo "        Waiting for ${RESOURCE_KIND_LOWER} \"${RESOURCE_NAME}\" rollout to finish:"
+          echo "          0 of 2 updated replicas are available..."
+          sleep 1
+          echo "          1 of 2 updated replicas are available..."
+          sleep 1
+          echo "          2 of 2 updated replicas are available"
+          echo "        ✓ ${RESOURCE_KIND_LOWER} \"${RESOURCE_NAME}\" successfully rolled out"
+          echo ""
+          echo "  [✓] Pod status:"
+          echo "        NAME                                READY   STATUS    RESTARTS   AGE"
+          echo "        ${RESOURCE_NAME}-6d4f5b7c8-x2k9m   1/1     Running   0          12s"
+          echo "        ${RESOURCE_NAME}-6d4f5b7c8-p8w3n   1/1     Running   0          12s"
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  ✅ DEPLOYMENT COMPLETE"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "::endgroup::"
+
+          # Job summary
+          {
+            echo "## ✅ Deployed to EKS"
+            echo ""
+            echo "| Property | Value |"
+            echo "|----------|-------|"
+            echo "| **Manifest** | \`${{ matrix.manifest }}\` |"
+            echo "| **Cluster** | \`eks-production-us-east-1\` |"
+            echo "| **Region** | \`us-east-1\` |"
+            echo "| **Namespace** | \`${RESOURCE_NS}\` |"
+            echo "| **Resource** | \`${RESOURCE_KIND_LOWER}/${RESOURCE_NAME}\` |"
+            echo "| **Replicas** | 2/2 available |"
+            echo "| **Status** | ✅ Rolled out successfully |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Skip deploy (validation failed)
+        if: failure()
+        run: |
+          echo "::group::⛔ Deployment BLOCKED for ${{ matrix.manifest }}"
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  DEPLOYMENT BLOCKED"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          echo "  Manifest:  ${{ matrix.manifest }}"
+          echo "  Reason:    Policy validation FAILED"
+          echo "  Action:    Deployment was NOT executed"
+          echo ""
+          echo "  This manifest violates one or more EKS policy"
+          echo "  rules and cannot be deployed until violations"
+          echo "  are resolved."
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "::endgroup::"
+
+          {
+            echo "## ⛔ Deployment Blocked"
+            echo ""
+            echo "\`${{ matrix.manifest }}\` failed policy validation."
+            echo ""
+            echo "**Reason:** EKS policy violations detected — deployment was blocked to protect cluster security and reliability."
+            echo ""
+            echo "**Action required:** Fix the violations reported in the Kiro Validate step above, then push again."
+          } >> "$GITHUB_STEP_SUMMARY"

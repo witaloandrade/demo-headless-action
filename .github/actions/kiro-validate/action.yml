@@ -55,15 +55,41 @@ runs:
 
         # --- Install Kiro CLI ---
         echo "Installing Kiro CLI..."
-        if ! curl -fsSL https://kiro.dev/install.sh | bash; then
+        wget -q https://desktop-release.q.us-east-1.amazonaws.com/latest/kiro-cli.deb -O /tmp/kiro-cli.deb
+        if ! sudo dpkg -i /tmp/kiro-cli.deb; then
+          sudo apt-get install -f -y
+        fi
+        rm -f /tmp/kiro-cli.deb
+
+        # Verify installation
+        if ! command -v kiro-cli &> /dev/null; then
           echo "Error: Failed to install Kiro CLI"
           exit 1
         fi
 
-        # Add Kiro CLI to PATH if installed to a local directory
-        export PATH="$HOME/.local/bin:$HOME/.kiro/bin:$PATH"
+        # --- Discover Manifest Files ---
+        MANIFEST_FILES=()
+        if [[ -d "$MANIFESTS_PATH" ]]; then
+          while IFS= read -r -d '' f; do
+            MANIFEST_FILES+=("$f")
+          done < <(find "$MANIFESTS_PATH" -type f \( -name "*.yaml" -o -name "*.yml" \) -print0 | sort -z)
+        else
+          MANIFEST_FILES+=("$MANIFESTS_PATH")
+        fi
+
+        if [[ ${#MANIFEST_FILES[@]} -eq 0 ]]; then
+          echo "::error::No YAML manifest files found at '$MANIFESTS_PATH'"
+          exit 1
+        fi
+
+        echo "📋 Found ${#MANIFEST_FILES[@]} manifest file(s) to validate"
+        for f in "${MANIFEST_FILES[@]}"; do
+          echo "   • $f"
+        done
+        echo ""
 
         # --- Construct Prompt ---
+        # Request structured output so we can parse per-file results
         PROMPT="You are a Kubernetes policy validation tool. Read the EKS policy steering file at '${POLICY_PATH}' and validate the Kubernetes manifests at '${MANIFESTS_PATH}' against every rule defined in the policy.
 
         For each manifest file, check all 6 policy rules:
@@ -74,14 +100,24 @@ runs:
         5. Namespace Isolation
         6. High Availability
 
-        Output your findings in the following format:
-        - If violations are found, start with 'VIOLATIONS FOUND' on the first line, then list each violation with the rule name, file, and remediation guidance.
-        - If no violations are found, start with 'NO VIOLATIONS' on the first line, then confirm all rules pass.
+        Output your findings using EXACTLY this structured format:
+
+        --- FILE: <relative path to manifest file> ---
+        STATUS: PASS | FAIL
+        VIOLATIONS:
+        - [Rule N: <Rule Name>] <short description of violation>
+          REMEDIATION: <brief fix guidance>
+        ---
+
+        Repeat the above block for each manifest file. If a file passes all rules, set STATUS: PASS and leave VIOLATIONS empty.
+
+        After all file blocks, output a final summary line:
+        SUMMARY: <number of files passed>/<total files> passed, <number of violations> total violation(s)
 
         Be thorough and check every rule against every manifest file found at the specified path."
 
         # --- Invoke Kiro CLI ---
-        echo "Running Kiro validation..."
+        echo "::group::🔍 Running Kiro policy validation"
         KIRO_OUTPUT=""
         KIRO_EXIT_CODE=0
 
@@ -90,46 +126,222 @@ runs:
         else
           KIRO_EXIT_CODE=$?
         fi
+        echo "::endgroup::"
 
         # Check for timeout (exit code 124)
         if [[ $KIRO_EXIT_CODE -eq 124 ]]; then
-          echo "Error: Kiro CLI execution timed out"
+          echo "::error::Kiro CLI execution timed out after 240 seconds"
           exit 1
         fi
 
         # Check for unexpected CLI failure (non-zero exit that isn't a validation failure)
         if [[ $KIRO_EXIT_CODE -ne 0 && -z "$KIRO_OUTPUT" ]]; then
-          echo "Error: Kiro CLI execution failed unexpectedly"
+          echo "::error::Kiro CLI execution failed unexpectedly (exit code: $KIRO_EXIT_CODE)"
           exit 1
         fi
 
-        # --- Parse Output ---
-        echo "$KIRO_OUTPUT"
+        # --- Strip ANSI escape codes for reliable parsing ---
+        CLEAN_OUTPUT=$(echo "$KIRO_OUTPUT" | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' | sed 's/\x1b\[[?][0-9]*[a-zA-Z]//g' | sed 's/\x0f//g' | sed 's/\x1b//g')
 
-        # Set multiline report output
+        # --- Parse and Display Structured Output ---
+        echo ""
+        echo "════════════════════════════════════════════════════════════════"
+        echo "  EKS POLICY VALIDATION RESULTS"
+        echo "════════════════════════════════════════════════════════════════"
+        echo ""
+
+        # Track per-file results for summary
+        TOTAL_FILES=0
+        PASSED_FILES=0
+        FAILED_FILES=0
+        TOTAL_VIOLATIONS=0
+        FAILED_FILE_LIST=""
+
+        # Parse per-file blocks from cleaned output
+        # Kiro outputs: "FILE: <path> ---" (possibly with leading separators)
+        CURRENT_FILE=""
+        CURRENT_STATUS=""
+        CURRENT_VIOLATIONS=""
+        IN_FILE_BLOCK=false
+
+        while IFS= read -r line; do
+          # Match "FILE: <path> ---" anywhere in the line
+          if [[ "$line" =~ FILE:[[:space:]]*(.*[^[:space:]])[[:space:]]*--- ]]; then
+            # Process previous block if exists
+            if [[ -n "$CURRENT_FILE" ]]; then
+              TOTAL_FILES=$((TOTAL_FILES + 1))
+              if [[ "$CURRENT_STATUS" == "PASS" ]]; then
+                PASSED_FILES=$((PASSED_FILES + 1))
+                echo "  ✅ PASS: $CURRENT_FILE"
+              else
+                FAILED_FILES=$((FAILED_FILES + 1))
+                FAILED_FILE_LIST="${FAILED_FILE_LIST}${CURRENT_FILE}"$'\n'
+                echo "  ❌ FAIL: $CURRENT_FILE"
+                if [[ -n "$CURRENT_VIOLATIONS" ]]; then
+                  echo "$CURRENT_VIOLATIONS" | while IFS= read -r v; do
+                    if [[ -n "$v" ]]; then
+                      echo "       $v"
+                    fi
+                  done
+                fi
+                echo "::error file=${CURRENT_FILE}::Policy violations found in ${CURRENT_FILE}"
+              fi
+              echo ""
+            fi
+            CURRENT_FILE="${BASH_REMATCH[1]}"
+            CURRENT_STATUS=""
+            CURRENT_VIOLATIONS=""
+            IN_FILE_BLOCK=true
+          elif [[ "$IN_FILE_BLOCK" == true && "$line" =~ STATUS:[[:space:]]*(PASS|FAIL) ]]; then
+            CURRENT_STATUS="${BASH_REMATCH[1]}"
+          elif [[ "$IN_FILE_BLOCK" == true && "$line" =~ ^-[[:space:]]*\[Rule ]]; then
+            CURRENT_VIOLATIONS="${CURRENT_VIOLATIONS}${line}"$'\n'
+            TOTAL_VIOLATIONS=$((TOTAL_VIOLATIONS + 1))
+          elif [[ "$IN_FILE_BLOCK" == true && "$line" =~ REMEDIATION: ]]; then
+            CURRENT_VIOLATIONS="${CURRENT_VIOLATIONS}  ${line}"$'\n'
+          fi
+        done <<< "$CLEAN_OUTPUT"
+
+        # Process the last file block
+        if [[ -n "$CURRENT_FILE" ]]; then
+          TOTAL_FILES=$((TOTAL_FILES + 1))
+          if [[ "$CURRENT_STATUS" == "PASS" ]]; then
+            PASSED_FILES=$((PASSED_FILES + 1))
+            echo "  ✅ PASS: $CURRENT_FILE"
+          else
+            FAILED_FILES=$((FAILED_FILES + 1))
+            FAILED_FILE_LIST="${FAILED_FILE_LIST}${CURRENT_FILE}"$'\n'
+            echo "  ❌ FAIL: $CURRENT_FILE"
+            if [[ -n "$CURRENT_VIOLATIONS" ]]; then
+              echo "$CURRENT_VIOLATIONS" | while IFS= read -r v; do
+                if [[ -n "$v" ]]; then
+                  echo "       $v"
+                fi
+              done
+            fi
+            echo "::error file=${CURRENT_FILE}::Policy violations found in ${CURRENT_FILE}"
+          fi
+          echo ""
+        fi
+
+        # --- Summary Banner ---
+        echo "════════════════════════════════════════════════════════════════"
+        if [[ $TOTAL_FILES -gt 0 ]]; then
+          echo "  📊 SUMMARY: ${PASSED_FILES}/${TOTAL_FILES} files passed | ${TOTAL_VIOLATIONS} violation(s) found"
+        else
+          echo "  📊 SUMMARY: Could not parse per-file results"
+        fi
+        echo "════════════════════════════════════════════════════════════════"
+        echo ""
+
+        # --- Write Job Summary (visible in GitHub Actions UI) ---
+        {
+          echo "## 🛡️ EKS Policy Validation Results"
+          echo ""
+          if [[ $FAILED_FILES -gt 0 ]]; then
+            echo "**Status:** ❌ Failed — ${TOTAL_VIOLATIONS} violation(s) in ${FAILED_FILES} file(s)"
+          elif [[ $TOTAL_FILES -gt 0 ]]; then
+            echo "**Status:** ✅ Passed — all files compliant"
+          else
+            echo "**Status:** ⚠️ Could not parse structured results"
+          fi
+          echo ""
+          echo "| File | Status | Violations |"
+          echo "|------|--------|------------|"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        # Add per-file rows to job summary (re-parse for table)
+        CURRENT_FILE=""
+        CURRENT_STATUS=""
+        FILE_VIOLATIONS=0
+        while IFS= read -r line; do
+          if [[ "$line" =~ FILE:[[:space:]]*(.*[^[:space:]])[[:space:]]*--- ]]; then
+            if [[ -n "$CURRENT_FILE" ]]; then
+              if [[ "$CURRENT_STATUS" == "PASS" ]]; then
+                echo "| \`$CURRENT_FILE\` | ✅ Pass | 0 |" >> "$GITHUB_STEP_SUMMARY"
+              else
+                echo "| \`$CURRENT_FILE\` | ❌ Fail | $FILE_VIOLATIONS |" >> "$GITHUB_STEP_SUMMARY"
+              fi
+            fi
+            CURRENT_FILE="${BASH_REMATCH[1]}"
+            CURRENT_STATUS=""
+            FILE_VIOLATIONS=0
+          elif [[ "$line" =~ STATUS:[[:space:]]*(PASS|FAIL) ]]; then
+            CURRENT_STATUS="${BASH_REMATCH[1]}"
+          elif [[ "$line" =~ ^-[[:space:]]*\[Rule ]]; then
+            FILE_VIOLATIONS=$((FILE_VIOLATIONS + 1))
+          fi
+        done <<< "$CLEAN_OUTPUT"
+        # Last file
+        if [[ -n "$CURRENT_FILE" ]]; then
+          if [[ "$CURRENT_STATUS" == "PASS" ]]; then
+            echo "| \`$CURRENT_FILE\` | ✅ Pass | 0 |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| \`$CURRENT_FILE\` | ❌ Fail | $FILE_VIOLATIONS |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+        fi
+
+        # Add violation details to job summary
+        if [[ $FAILED_FILES -gt 0 ]]; then
+          {
+            echo ""
+            echo "### Violation Details"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          CURRENT_FILE=""
+          IN_VIOLATIONS=false
+          while IFS= read -r line; do
+            if [[ "$line" =~ FILE:[[:space:]]*(.*[^[:space:]])[[:space:]]*--- ]]; then
+              CURRENT_FILE="${BASH_REMATCH[1]}"
+              IN_VIOLATIONS=false
+            elif [[ "$line" =~ STATUS:[[:space:]]*FAIL ]]; then
+              echo "**\`$CURRENT_FILE\`**" >> "$GITHUB_STEP_SUMMARY"
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+              IN_VIOLATIONS=true
+            elif [[ "$IN_VIOLATIONS" == true && "$line" =~ ^-[[:space:]]*\[Rule ]]; then
+              echo "- ${line#- }" >> "$GITHUB_STEP_SUMMARY"
+            elif [[ "$IN_VIOLATIONS" == true && "$line" =~ REMEDIATION: ]]; then
+              local_rem="${line#*REMEDIATION: }"
+              echo "  - 💡 ${local_rem}" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done <<< "$CLEAN_OUTPUT"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+        # --- Raw Output in Collapsed Group ---
+        echo "::group::📄 Full Kiro validation output (raw)"
+        echo "$KIRO_OUTPUT"
+        echo "::endgroup::"
+
+        # --- Set Output ---
         {
           echo "report<<EOF"
-          echo "$KIRO_OUTPUT"
+          echo "$CLEAN_OUTPUT"
           echo "EOF"
         } >> "$GITHUB_OUTPUT"
 
-        # Determine pass/fail based on output content
-        if echo "$KIRO_OUTPUT" | grep -qi "VIOLATIONS FOUND"; then
-          echo ""
-          echo "Policy validation failed: violations detected."
+        # --- Determine Pass/Fail ---
+        if [[ $FAILED_FILES -gt 0 ]]; then
+          echo "::error::Policy validation failed: ${TOTAL_VIOLATIONS} violation(s) in ${FAILED_FILES} file(s)"
           exit 1
-        elif echo "$KIRO_OUTPUT" | grep -qi "NO VIOLATIONS"; then
-          echo ""
+        elif [[ $PASSED_FILES -gt 0 ]]; then
+          echo "Policy validation passed: all ${PASSED_FILES} file(s) compliant."
+          exit 0
+        fi
+
+        # Fallback: if structured parsing didn't work, use keyword matching on clean output
+        if echo "$CLEAN_OUTPUT" | grep -q "STATUS: FAIL"; then
+          echo "::error::Policy validation failed: violations detected (fallback detection)"
+          exit 1
+        elif echo "$CLEAN_OUTPUT" | grep -q "STATUS: PASS"; then
           echo "Policy validation passed: no violations detected."
           exit 0
         else
-          # If Kiro CLI exited non-zero and we couldn't parse the output
           if [[ $KIRO_EXIT_CODE -ne 0 ]]; then
-            echo "Error: Kiro CLI execution failed unexpectedly"
+            echo "::error::Kiro CLI execution failed unexpectedly"
             exit 1
           fi
-          # Default to pass if output doesn't match expected patterns but CLI succeeded
-          echo ""
-          echo "Policy validation completed."
+          echo "Policy validation completed (could not determine structured results)."
           exit 0
         fi
