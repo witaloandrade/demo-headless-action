@@ -55,13 +55,17 @@ runs:
 
         # --- Install Kiro CLI ---
         echo "Installing Kiro CLI..."
-        if ! curl -fsSL https://kiro.dev/install.sh | bash; then
+        wget -q https://desktop-release.q.us-east-1.amazonaws.com/latest/kiro-cli.deb -O /tmp/kiro-cli.deb
+        if ! sudo dpkg -i /tmp/kiro-cli.deb; then
+          sudo apt-get install -f -y
+        fi
+        rm -f /tmp/kiro-cli.deb
+
+        # Verify installation
+        if ! command -v kiro-cli &> /dev/null; then
           echo "Error: Failed to install Kiro CLI"
           exit 1
         fi
-
-        # Add Kiro CLI to PATH if installed to a local directory
-        export PATH="$HOME/.local/bin:$HOME/.kiro/bin:$PATH"
 
         # --- Construct Prompt ---
         PROMPT="You are a Kubernetes policy validation tool. Read the EKS policy steering file at '${POLICY_PATH}' and validate the Kubernetes manifests at '${MANIFESTS_PATH}' against every rule defined in the policy.
