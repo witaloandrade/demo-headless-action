@@ -16,23 +16,19 @@ jobs:
       - name: Find manifest files
         id: find
         run: |
-          # Find all YAML manifests and build a JSON array
           FILES=$(find manifests/ -type f \( -name "*.yaml" -o -name "*.yml" \) | sort | jq -R -s -c 'split("\n") | map(select(length > 0))')
           echo "manifests=$FILES" >> "$GITHUB_OUTPUT"
           echo "📋 Found manifests: $FILES"
 
-  # Job 2: Validate each manifest independently (runs in parallel)
-  validate:
+  # Job 2: Validate and deploy each manifest independently
+  validate-and-deploy:
     runs-on: ubuntu-latest
     needs: [discover]
-    timeout-minutes: 5
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
         manifest: ${{ fromJson(needs.discover.outputs.manifests) }}
-    outputs:
-      # Matrix outputs use the last value; we track per-file in deploy job via needs
-      result: ${{ steps.kiro-validate.outcome }}
     steps:
       - uses: actions/checkout@v4
 
@@ -45,135 +41,36 @@ jobs:
         env:
           KIRO_API_KEY: ${{ secrets.KIRO_API_KEY }}
 
-  # Job 3: Deploy only compliant manifests
-  deploy:
-    runs-on: ubuntu-latest
-    needs: [discover, validate]
-    # Run even if some validations failed (we deploy the passing ones)
-    if: always() && needs.discover.result == 'success'
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Determine compliant manifests
-        id: compliant
-        run: |
-          echo "## 🚀 Deployment Decision" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-
-          # Since matrix jobs don't directly expose per-file pass/fail to downstream,
-          # we re-run a lightweight check: if validate job succeeded, all files passed.
-          # If it failed, we need to identify which ones passed.
-          # We use the GitHub API to check individual matrix job conclusions.
-
-          VALIDATE_STATUS="${{ needs.validate.result }}"
-
-          if [[ "$VALIDATE_STATUS" == "success" ]]; then
-            # All validations passed — deploy everything
-            MANIFESTS='${{ needs.discover.outputs.manifests }}'
-            echo "compliant_files=$MANIFESTS" >> "$GITHUB_OUTPUT"
-            echo "has_compliant=true" >> "$GITHUB_OUTPUT"
-            echo "All manifests passed validation. Deploying all." 
-            echo "✅ All manifests passed validation — deploying all files." >> "$GITHUB_STEP_SUMMARY"
-          else
-            # Some validations failed — use the GitHub API to find which matrix jobs passed
-            echo "Some validations failed. Checking individual results..."
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-
-            COMPLIANT_FILES="[]"
-            FAILED_FILES="[]"
-
-            # Query the workflow run's jobs to find matrix results
-            JOBS_JSON=$(gh api \
-              "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs?per_page=100" \
-              --jq '.jobs[] | select(.name | startswith("validate")) | {name: .name, conclusion: .conclusion}' 2>/dev/null || echo "")
-
-            if [[ -n "$JOBS_JSON" ]]; then
-              # Parse each manifest from the matrix and check its job status
-              MANIFESTS_ARRAY='${{ needs.discover.outputs.manifests }}'
-              COMPLIANT_LIST=""
-              FAILED_LIST=""
-
-              for manifest in $(echo "$MANIFESTS_ARRAY" | jq -r '.[]'); do
-                # The job name format is "validate (<manifest>)"
-                JOB_CONCLUSION=$(echo "$JOBS_JSON" | jq -r --arg m "$manifest" 'select(.name | contains($m)) | .conclusion' 2>/dev/null || echo "")
-
-                if [[ "$JOB_CONCLUSION" == "success" ]]; then
-                  COMPLIANT_LIST="${COMPLIANT_LIST:+$COMPLIANT_LIST,}\"$manifest\""
-                  echo "  ✅ PASS: $manifest" 
-                  echo "- ✅ \`$manifest\` — will deploy" >> "$GITHUB_STEP_SUMMARY"
-                else
-                  FAILED_LIST="${FAILED_LIST:+$FAILED_LIST,}\"$manifest\""
-                  echo "  ❌ FAIL: $manifest"
-                  echo "- ❌ \`$manifest\` — skipped (policy violation)" >> "$GITHUB_STEP_SUMMARY"
-                fi
-              done
-
-              COMPLIANT_FILES="[${COMPLIANT_LIST}]"
-              FAILED_FILES="[${FAILED_LIST}]"
-            else
-              echo "⚠️ Could not query job results via API. Skipping deployment." >> "$GITHUB_STEP_SUMMARY"
-              COMPLIANT_FILES="[]"
-            fi
-
-            echo "compliant_files=$COMPLIANT_FILES" >> "$GITHUB_OUTPUT"
-
-            if [[ "$COMPLIANT_FILES" != "[]" ]]; then
-              echo "has_compliant=true" >> "$GITHUB_OUTPUT"
-            else
-              echo "has_compliant=false" >> "$GITHUB_OUTPUT"
-              echo ""
-              echo "⚠️ No compliant manifests to deploy."
-              echo "" >> "$GITHUB_STEP_SUMMARY"
-              echo "**No manifests deployed.**" >> "$GITHUB_STEP_SUMMARY"
-            fi
-          fi
-        env:
-          GH_TOKEN: ${{ github.token }}
-
       - name: Configure kubectl
-        if: steps.compliant.outputs.has_compliant == 'true'
+        if: success()
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.EKS_DEPLOY_ROLE_ARN }}
           aws-region: us-west-2
 
-      - name: Deploy compliant manifests
-        if: steps.compliant.outputs.has_compliant == 'true'
+      - name: Deploy to EKS
+        if: success()
         run: |
-          COMPLIANT='${{ steps.compliant.outputs.compliant_files }}'
-          DEPLOY_COUNT=0
-          FAIL_COUNT=0
-
-          echo "## 📦 Deployment Results" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| File | Status |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|------|--------|" >> "$GITHUB_STEP_SUMMARY"
-
-          for manifest in $(echo "$COMPLIANT" | jq -r '.[]'); do
-            echo "::group::Deploying $manifest"
-            if kubectl apply -f "$manifest" 2>&1 | tee /tmp/deploy-output.txt; then
-              echo "✅ Successfully deployed: $manifest"
-              echo "| \`$manifest\` | ✅ Deployed |" >> "$GITHUB_STEP_SUMMARY"
-              DEPLOY_COUNT=$((DEPLOY_COUNT + 1))
-            else
-              echo "::error file=${manifest}::Failed to deploy ${manifest}"
-              echo "| \`$manifest\` | ❌ Failed |" >> "$GITHUB_STEP_SUMMARY"
-              FAIL_COUNT=$((FAIL_COUNT + 1))
-            fi
+          echo "::group::Deploying ${{ matrix.manifest }}"
+          if kubectl apply -f "${{ matrix.manifest }}" 2>&1 | tee /tmp/deploy-output.txt; then
             echo "::endgroup::"
-          done
-
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "**Summary:** ${DEPLOY_COUNT} deployed, ${FAIL_COUNT} failed" >> "$GITHUB_STEP_SUMMARY"
-
-          if [[ $FAIL_COUNT -gt 0 ]]; then
+            echo "## ✅ Deployment Successful" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "\`${{ matrix.manifest }}\` passed policy validation and was deployed." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::endgroup::"
+            echo "## ❌ Deployment Failed" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "\`${{ matrix.manifest }}\` passed validation but \`kubectl apply\` failed:" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat /tmp/deploy-output.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
 
-      - name: Deployment summary
-        if: always()
+      - name: Skip deploy (validation failed)
+        if: failure()
         run: |
-          VALIDATE_STATUS="${{ needs.validate.result }}"
-          if [[ "$VALIDATE_STATUS" == "failure" ]]; then
-            echo "::warning::Some manifests were not deployed due to policy violations"
-          fi
+          echo "## ⛔ Deployment Skipped" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`${{ matrix.manifest }}\` failed policy validation and was **not deployed**." >> "$GITHUB_STEP_SUMMARY"
