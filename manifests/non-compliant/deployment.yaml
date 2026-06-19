@@ -1,0 +1,23 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-non-compliant
+  # No namespace — violates Rule 5
+spec:
+  replicas: 1                  # Violates Rule 6 (< 2)
+  selector:
+    matchLabels:
+      app: nginx-non-compliant
+  template:
+    metadata:
+      labels:
+        app: nginx-non-compliant
+    spec:
+      # No securityContext — violates Rule 2
+      containers:
+        - name: nginx
+          image: nginx:latest  # Violates Rule 4
+          ports:
+            - containerPort: 80
+          # No resources — violates Rule 1
+          # No probes — violates Rule 3

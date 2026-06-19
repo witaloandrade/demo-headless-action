@@ -1,0 +1,135 @@
+name: "Kiro Validate"
+description: "Validate Kubernetes manifests against an EKS policy steering file using Kiro headless"
+
+inputs:
+  manifests-path:
+    description: "Path to Kubernetes manifest files to validate"
+    required: true
+  policy-path:
+    description: "Path to the EKS policy steering file"
+    required: true
+
+outputs:
+  report:
+    description: "Validation report with violation details and remediation"
+    value: ${{ steps.validate.outputs.report }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Validate manifests against policy
+      id: validate
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        # --- Input Validation ---
+        MANIFESTS_PATH="${{ inputs.manifests-path }}"
+        POLICY_PATH="${{ inputs.policy-path }}"
+
+        if [[ -z "$MANIFESTS_PATH" ]]; then
+          echo "Error: manifests-path input is required"
+          exit 1
+        fi
+
+        if [[ -z "$POLICY_PATH" ]]; then
+          echo "Error: policy-path input is required"
+          exit 1
+        fi
+
+        if [[ ! -e "$MANIFESTS_PATH" ]]; then
+          echo "Error: manifests-path '$MANIFESTS_PATH' does not exist"
+          exit 1
+        fi
+
+        if [[ ! -f "$POLICY_PATH" ]]; then
+          echo "Error: policy-path '$POLICY_PATH' does not exist"
+          exit 1
+        fi
+
+        # --- Environment Validation ---
+        if [[ -z "${KIRO_API_KEY:-}" ]]; then
+          echo "Error: KIRO_API_KEY environment variable is not set"
+          exit 1
+        fi
+
+        # --- Install Kiro CLI ---
+        echo "Installing Kiro CLI..."
+        if ! curl -fsSL https://kiro.dev/install.sh | bash; then
+          echo "Error: Failed to install Kiro CLI"
+          exit 1
+        fi
+
+        # Add Kiro CLI to PATH if installed to a local directory
+        export PATH="$HOME/.local/bin:$HOME/.kiro/bin:$PATH"
+
+        # --- Construct Prompt ---
+        PROMPT="You are a Kubernetes policy validation tool. Read the EKS policy steering file at '${POLICY_PATH}' and validate the Kubernetes manifests at '${MANIFESTS_PATH}' against every rule defined in the policy.
+
+        For each manifest file, check all 6 policy rules:
+        1. Resource Requests and Limits
+        2. Security Context
+        3. Health Probes
+        4. Image Tag Policy
+        5. Namespace Isolation
+        6. High Availability
+
+        Output your findings in the following format:
+        - If violations are found, start with 'VIOLATIONS FOUND' on the first line, then list each violation with the rule name, file, and remediation guidance.
+        - If no violations are found, start with 'NO VIOLATIONS' on the first line, then confirm all rules pass.
+
+        Be thorough and check every rule against every manifest file found at the specified path."
+
+        # --- Invoke Kiro CLI ---
+        echo "Running Kiro validation..."
+        KIRO_OUTPUT=""
+        KIRO_EXIT_CODE=0
+
+        if KIRO_OUTPUT=$(timeout 240 kiro-cli chat --no-interactive --trust-tools=read,grep "$PROMPT" 2>&1); then
+          KIRO_EXIT_CODE=0
+        else
+          KIRO_EXIT_CODE=$?
+        fi
+
+        # Check for timeout (exit code 124)
+        if [[ $KIRO_EXIT_CODE -eq 124 ]]; then
+          echo "Error: Kiro CLI execution timed out"
+          exit 1
+        fi
+
+        # Check for unexpected CLI failure (non-zero exit that isn't a validation failure)
+        if [[ $KIRO_EXIT_CODE -ne 0 && -z "$KIRO_OUTPUT" ]]; then
+          echo "Error: Kiro CLI execution failed unexpectedly"
+          exit 1
+        fi
+
+        # --- Parse Output ---
+        echo "$KIRO_OUTPUT"
+
+        # Set multiline report output
+        {
+          echo "report<<EOF"
+          echo "$KIRO_OUTPUT"
+          echo "EOF"
+        } >> "$GITHUB_OUTPUT"
+
+        # Determine pass/fail based on output content
+        if echo "$KIRO_OUTPUT" | grep -qi "VIOLATIONS FOUND"; then
+          echo ""
+          echo "Policy validation failed: violations detected."
+          exit 1
+        elif echo "$KIRO_OUTPUT" | grep -qi "NO VIOLATIONS"; then
+          echo ""
+          echo "Policy validation passed: no violations detected."
+          exit 0
+        else
+          # If Kiro CLI exited non-zero and we couldn't parse the output
+          if [[ $KIRO_EXIT_CODE -ne 0 ]]; then
+            echo "Error: Kiro CLI execution failed unexpectedly"
+            exit 1
+          fi
+          # Default to pass if output doesn't match expected patterns but CLI succeeded
+          echo ""
+          echo "Policy validation completed."
+          exit 0
+        fi

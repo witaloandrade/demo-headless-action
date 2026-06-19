@@ -1,0 +1,84 @@
+name: Kiro EKS Policy Gate
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      report: ${{ steps.kiro-validate.outputs.report }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Kiro Validate
+        id: kiro-validate
+        uses: ./.github/actions/kiro-validate
+        with:
+          manifests-path: "manifests/"
+          policy-path: ".kiro/steering/eks-policy.md"
+        env:
+          KIRO_API_KEY: ${{ secrets.KIRO_API_KEY }}
+
+      - name: Write validation report to summary
+        if: always()
+        run: |
+          echo "## Kiro Policy Validation Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.kiro-validate.outcome }}" = "success" ]; then
+            echo "✅ **Validation Passed**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Validation Failed**" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.kiro-validate.outputs.report }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: [validate]
+    if: success()
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure kubectl
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.EKS_DEPLOY_ROLE_ARN }}
+          aws-region: us-west-2
+
+      - name: Deploy to EKS
+        id: deploy
+        run: |
+          if ! kubectl apply -f manifests/ 2>&1 | tee /tmp/deploy-output.txt; then
+            echo "## ❌ Deployment Failed" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "The \`kubectl apply\` command failed:" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            cat /tmp/deploy-output.txt >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+      - name: Verify pod readiness
+        id: readiness
+        run: |
+          if ! kubectl wait --for=condition=Ready pods --all -n demo-app --timeout=120s 2>&1 | tee /tmp/readiness-output.txt; then
+            echo "## ❌ Pod Readiness Check Failed" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Pods did not reach Ready status within 120 seconds:" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            cat /tmp/readiness-output.txt >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+      - name: Write deployment success summary
+        if: success()
+        run: |
+          echo "## ✅ Deployment Successful" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Manifests applied and all pods reached Ready status." >> $GITHUB_STEP_SUMMARY
