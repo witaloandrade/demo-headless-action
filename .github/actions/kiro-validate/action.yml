@@ -140,6 +140,9 @@ runs:
           exit 1
         fi
 
+        # --- Strip ANSI escape codes for reliable parsing ---
+        CLEAN_OUTPUT=$(echo "$KIRO_OUTPUT" | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' | sed 's/\x1b\[[?][0-9]*[a-zA-Z]//g' | sed 's/\x0f//g' | sed 's/\x1b//g')
+
         # --- Parse and Display Structured Output ---
         echo ""
         echo "════════════════════════════════════════════════════════════════"
@@ -154,15 +157,16 @@ runs:
         TOTAL_VIOLATIONS=0
         FAILED_FILE_LIST=""
 
-        # Parse per-file blocks from Kiro output
+        # Parse per-file blocks from cleaned output
+        # Kiro outputs: "FILE: <path> ---" (possibly with leading separators)
         CURRENT_FILE=""
         CURRENT_STATUS=""
         CURRENT_VIOLATIONS=""
         IN_FILE_BLOCK=false
 
         while IFS= read -r line; do
-          # Detect file block start
-          if [[ "$line" =~ ^---[[:space:]]*FILE:[[:space:]]*(.*)[[:space:]]*---$ ]]; then
+          # Match "FILE: <path> ---" anywhere in the line
+          if [[ "$line" =~ FILE:[[:space:]]*(.*[^[:space:]])[[:space:]]*--- ]]; then
             # Process previous block if exists
             if [[ -n "$CURRENT_FILE" ]]; then
               TOTAL_FILES=$((TOTAL_FILES + 1))
@@ -171,17 +175,15 @@ runs:
                 echo "  ✅ PASS: $CURRENT_FILE"
               else
                 FAILED_FILES=$((FAILED_FILES + 1))
-                FAILED_FILE_LIST="${FAILED_FILE_LIST}${CURRENT_FILE}\n"
+                FAILED_FILE_LIST="${FAILED_FILE_LIST}${CURRENT_FILE}"$'\n'
                 echo "  ❌ FAIL: $CURRENT_FILE"
                 if [[ -n "$CURRENT_VIOLATIONS" ]]; then
                   echo "$CURRENT_VIOLATIONS" | while IFS= read -r v; do
                     if [[ -n "$v" ]]; then
                       echo "       $v"
-                      TOTAL_VIOLATIONS=$((TOTAL_VIOLATIONS + 1))
                     fi
                   done
                 fi
-                # Emit GitHub annotation for failed file
                 echo "::error file=${CURRENT_FILE}::Policy violations found in ${CURRENT_FILE}"
               fi
               echo ""
@@ -190,15 +192,15 @@ runs:
             CURRENT_STATUS=""
             CURRENT_VIOLATIONS=""
             IN_FILE_BLOCK=true
-          elif [[ "$IN_FILE_BLOCK" == true && "$line" =~ ^STATUS:[[:space:]]*(PASS|FAIL) ]]; then
+          elif [[ "$IN_FILE_BLOCK" == true && "$line" =~ STATUS:[[:space:]]*(PASS|FAIL) ]]; then
             CURRENT_STATUS="${BASH_REMATCH[1]}"
           elif [[ "$IN_FILE_BLOCK" == true && "$line" =~ ^-[[:space:]]*\[Rule ]]; then
-            CURRENT_VIOLATIONS="${CURRENT_VIOLATIONS}${line}\n"
+            CURRENT_VIOLATIONS="${CURRENT_VIOLATIONS}${line}"$'\n'
             TOTAL_VIOLATIONS=$((TOTAL_VIOLATIONS + 1))
-          elif [[ "$IN_FILE_BLOCK" == true && "$line" =~ ^[[:space:]]*REMEDIATION: ]]; then
-            CURRENT_VIOLATIONS="${CURRENT_VIOLATIONS}${line}\n"
+          elif [[ "$IN_FILE_BLOCK" == true && "$line" =~ REMEDIATION: ]]; then
+            CURRENT_VIOLATIONS="${CURRENT_VIOLATIONS}  ${line}"$'\n'
           fi
-        done <<< "$KIRO_OUTPUT"
+        done <<< "$CLEAN_OUTPUT"
 
         # Process the last file block
         if [[ -n "$CURRENT_FILE" ]]; then
@@ -208,10 +210,10 @@ runs:
             echo "  ✅ PASS: $CURRENT_FILE"
           else
             FAILED_FILES=$((FAILED_FILES + 1))
-            FAILED_FILE_LIST="${FAILED_FILE_LIST}${CURRENT_FILE}\n"
+            FAILED_FILE_LIST="${FAILED_FILE_LIST}${CURRENT_FILE}"$'\n'
             echo "  ❌ FAIL: $CURRENT_FILE"
             if [[ -n "$CURRENT_VIOLATIONS" ]]; then
-              echo -e "$CURRENT_VIOLATIONS" | while IFS= read -r v; do
+              echo "$CURRENT_VIOLATIONS" | while IFS= read -r v; do
                 if [[ -n "$v" ]]; then
                   echo "       $v"
                 fi
@@ -238,52 +240,84 @@ runs:
           echo ""
           if [[ $FAILED_FILES -gt 0 ]]; then
             echo "**Status:** ❌ Failed — ${TOTAL_VIOLATIONS} violation(s) in ${FAILED_FILES} file(s)"
-          else
+          elif [[ $TOTAL_FILES -gt 0 ]]; then
             echo "**Status:** ✅ Passed — all files compliant"
+          else
+            echo "**Status:** ⚠️ Could not parse structured results"
           fi
           echo ""
-          echo "| File | Status |"
-          echo "|------|--------|"
+          echo "| File | Status | Violations |"
+          echo "|------|--------|------------|"
         } >> "$GITHUB_STEP_SUMMARY"
 
         # Add per-file rows to job summary (re-parse for table)
         CURRENT_FILE=""
         CURRENT_STATUS=""
+        FILE_VIOLATIONS=0
         while IFS= read -r line; do
-          if [[ "$line" =~ ^---[[:space:]]*FILE:[[:space:]]*(.*)[[:space:]]*---$ ]]; then
+          if [[ "$line" =~ FILE:[[:space:]]*(.*[^[:space:]])[[:space:]]*--- ]]; then
             if [[ -n "$CURRENT_FILE" ]]; then
               if [[ "$CURRENT_STATUS" == "PASS" ]]; then
-                echo "| \`$CURRENT_FILE\` | ✅ Pass |" >> "$GITHUB_STEP_SUMMARY"
+                echo "| \`$CURRENT_FILE\` | ✅ Pass | 0 |" >> "$GITHUB_STEP_SUMMARY"
               else
-                echo "| \`$CURRENT_FILE\` | ❌ Fail |" >> "$GITHUB_STEP_SUMMARY"
+                echo "| \`$CURRENT_FILE\` | ❌ Fail | $FILE_VIOLATIONS |" >> "$GITHUB_STEP_SUMMARY"
               fi
             fi
             CURRENT_FILE="${BASH_REMATCH[1]}"
             CURRENT_STATUS=""
-          elif [[ "$line" =~ ^STATUS:[[:space:]]*(PASS|FAIL) ]]; then
+            FILE_VIOLATIONS=0
+          elif [[ "$line" =~ STATUS:[[:space:]]*(PASS|FAIL) ]]; then
             CURRENT_STATUS="${BASH_REMATCH[1]}"
+          elif [[ "$line" =~ ^-[[:space:]]*\[Rule ]]; then
+            FILE_VIOLATIONS=$((FILE_VIOLATIONS + 1))
           fi
-        done <<< "$KIRO_OUTPUT"
+        done <<< "$CLEAN_OUTPUT"
         # Last file
         if [[ -n "$CURRENT_FILE" ]]; then
           if [[ "$CURRENT_STATUS" == "PASS" ]]; then
-            echo "| \`$CURRENT_FILE\` | ✅ Pass |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| \`$CURRENT_FILE\` | ✅ Pass | 0 |" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "| \`$CURRENT_FILE\` | ❌ Fail |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| \`$CURRENT_FILE\` | ❌ Fail | $FILE_VIOLATIONS |" >> "$GITHUB_STEP_SUMMARY"
           fi
         fi
 
-        echo "" >> "$GITHUB_STEP_SUMMARY"
+        # Add violation details to job summary
+        if [[ $FAILED_FILES -gt 0 ]]; then
+          {
+            echo ""
+            echo "### Violation Details"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          CURRENT_FILE=""
+          IN_VIOLATIONS=false
+          while IFS= read -r line; do
+            if [[ "$line" =~ FILE:[[:space:]]*(.*[^[:space:]])[[:space:]]*--- ]]; then
+              CURRENT_FILE="${BASH_REMATCH[1]}"
+              IN_VIOLATIONS=false
+            elif [[ "$line" =~ STATUS:[[:space:]]*FAIL ]]; then
+              echo "**\`$CURRENT_FILE\`**" >> "$GITHUB_STEP_SUMMARY"
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+              IN_VIOLATIONS=true
+            elif [[ "$IN_VIOLATIONS" == true && "$line" =~ ^-[[:space:]]*\[Rule ]]; then
+              echo "- ${line#- }" >> "$GITHUB_STEP_SUMMARY"
+            elif [[ "$IN_VIOLATIONS" == true && "$line" =~ REMEDIATION: ]]; then
+              local_rem="${line#*REMEDIATION: }"
+              echo "  - 💡 ${local_rem}" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done <<< "$CLEAN_OUTPUT"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+        fi
 
         # --- Raw Output in Collapsed Group ---
-        echo "::group::📄 Full Kiro validation output"
+        echo "::group::📄 Full Kiro validation output (raw)"
         echo "$KIRO_OUTPUT"
         echo "::endgroup::"
 
         # --- Set Output ---
         {
           echo "report<<EOF"
-          echo "$KIRO_OUTPUT"
+          echo "$CLEAN_OUTPUT"
           echo "EOF"
         } >> "$GITHUB_OUTPUT"
 
@@ -296,11 +330,11 @@ runs:
           exit 0
         fi
 
-        # Fallback: if structured parsing didn't work, use keyword matching
-        if echo "$KIRO_OUTPUT" | grep -qi "VIOLATIONS FOUND"; then
-          echo "::error::Policy validation failed: violations detected"
+        # Fallback: if structured parsing didn't work, use keyword matching on clean output
+        if echo "$CLEAN_OUTPUT" | grep -q "STATUS: FAIL"; then
+          echo "::error::Policy validation failed: violations detected (fallback detection)"
           exit 1
-        elif echo "$KIRO_OUTPUT" | grep -qi "NO VIOLATIONS"; then
+        elif echo "$CLEAN_OUTPUT" | grep -q "STATUS: PASS"; then
           echo "Policy validation passed: no violations detected."
           exit 0
         else
