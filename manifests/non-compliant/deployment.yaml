@@ -3,6 +3,7 @@ kind: Deployment
 metadata:
   name: nginx-non-compliant
   # No namespace — violates Rule 5
+  # Simple change to test action
 spec:
   replicas: 1                  # Violates Rule 6 (< 2)
   selector:
