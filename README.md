@@ -84,4 +84,4 @@ bash tests/smoke/test-workflow-structure.sh
 
 ## License
 
-Internal use only.
+MIT License
